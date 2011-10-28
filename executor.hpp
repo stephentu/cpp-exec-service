@@ -14,6 +14,13 @@ template <typename T>
 class JobRef {
 public:
   virtual T * ref() = 0;
+  virtual void execJob() {
+    T *r = ref();
+    if (r != NULL) {
+      T &ref_ = *r;
+      ref_();
+    }
+  }
 };
 
 template <typename T>
@@ -23,6 +30,71 @@ public:
   virtual T * ref() { return &m_t; }
 private:
   T m_t;
+};
+
+class ScopedLocker {
+public:
+  ScopedLocker(pthread_mutex_t *mutex) : m_mutex(mutex) {
+    assert(mutex != NULL);
+    int r = pthread_mutex_lock(m_mutex);
+    if (r) assert(false);
+  }
+  ~ScopedLocker() {
+    int r = pthread_mutex_unlock(m_mutex);
+    if (r) assert(false);
+  }
+private:
+  pthread_mutex_t *m_mutex;
+};
+
+template <typename T>
+class Future {
+public:
+  Future() : m_done(false) {
+    pthread_mutex_init(&m_mutex, NULL);
+    pthread_cond_init(&m_cv, NULL);
+  }
+  ~Future() {
+    pthread_cond_destroy(&m_cv);
+    pthread_mutex_destroy(&m_mutex);
+  }
+  void signal(const T &t) {
+    // signal mutex
+    ScopedLocker lock(&m_mutex);
+    assert(!m_done);
+    pthread_cond_broadcast(&m_cv);
+    m_t    = t;
+    m_done = true;
+  }
+  T waitFor() {
+    ScopedLocker lock(&m_mutex);
+    while (!m_done) pthread_cond_wait(&m_cv, &m_mutex);
+    assert(m_done);
+    return m_t;
+  }
+private:
+  pthread_mutex_t m_mutex;
+  pthread_cond_t  m_cv;
+  T               m_t;
+  bool m_done;
+};
+
+template <typename T, typename R>
+class JobRefContainerWithFuture : public JobRefContainer<T> {
+public:
+  JobRefContainerWithFuture(const T &t, Future<R> *ftch)
+    : JobRefContainer<T>(t), m_ftch(ftch) {
+    assert(ftch != NULL);
+  }
+  inline Future<R> * future() { return m_ftch; }
+  virtual void execJob() {
+    T *r = this->ref();
+    T &ref_ = *r;
+    R res = ref_();
+    future()->signal(res);
+  }
+private:
+  Future<R> *m_ftch;
 };
 
 template <typename T>
@@ -145,6 +217,7 @@ private:
   // non-copyable
   Executor(const Executor&);
 
+protected:
   size_t m_numWorkers;
   H m_errHandler;
   bool m_running;
@@ -152,6 +225,20 @@ private:
   typedef std::vector< Worker<T, H> > worker_vec;
   worker_vec m_workers;
   tbb::concurrent_bounded_queue< JobRef<T>* > m_queue;
+};
+
+template <typename T, typename R, typename H>
+class FutureExecutor : public Executor<T, H> {
+public:
+  FutureExecutor(size_t numWorkers,
+                 size_t capacity = 1U << 16,
+                 const H &errHandler = H()) :
+    Executor<T, H>(numWorkers, capacity, errHandler) {}
+
+  void submit(const T &t, Future<R> *ftch) {
+    assert(this->m_running);
+    this->m_queue.push(new JobRefContainerWithFuture<T, R>(t, ftch));
+  }
 };
 
 template <typename T, typename H>
@@ -162,15 +249,10 @@ void Worker<T, H>::startBody() {
     JobRef<T> *job = NULL;
     m_queue->pop(job);
     assert(job != NULL);
-    T * ref = job->ref();
     try {
-      if (ref != NULL) {
-        T &ref_ = *ref;
-        ref_();
-      }
+      job->execJob();
     } catch (...) {
-      assert(ref != NULL);
-      m_errHandler->operator()(m_id, *ref);
+      m_errHandler->operator()(m_id, *job->ref());
     }
     delete job;
   }
@@ -181,6 +263,12 @@ template <typename T>
 class Exec {
 public:
   typedef Executor<T, default_err_handler<T> > DefaultExecutor;
+};
+
+template <typename T, typename R>
+class FutureExec {
+public:
+  typedef FutureExecutor<T, R, default_err_handler<T> > DefaultFutureExecutor;
 };
 
 }
